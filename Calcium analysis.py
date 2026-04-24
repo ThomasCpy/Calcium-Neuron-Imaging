@@ -3,11 +3,8 @@ import re
 import glob
 import numpy as np
 import scipy.ndimage as ndi
-
-# force non-interactive backend to prevent tk thread crashes
 import matplotlib
 matplotlib.use('Agg')
-
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from skimage import io, filters, feature, exposure, morphology, segmentation, measure
@@ -98,7 +95,7 @@ def preprocess_image(img, tophat_radius=15):
     # median filter for salt and pepper noise
     img_denoised = filters.median(img, morphology.disk(1))
     
-    # tophat subtracts background gradients (crucial for accurate dendrite tracking)
+    # tophat subtracts background gradients
     selem = morphology.disk(tophat_radius)
     img_tophat = morphology.white_tophat(img_denoised, footprint=selem)
     
@@ -111,7 +108,6 @@ def segment_calcium_cells(img_tophat, original_img, method='triangle', min_cell_
     """
     img_smoothed = filters.gaussian(img_tophat, sigma=1.5)
     
-    # 1. rational thresholding selection
     if method == 'triangle':
         thresh = filters.threshold_triangle(img_smoothed)
     elif method == 'li':
@@ -122,7 +118,7 @@ def segment_calcium_cells(img_tophat, original_img, method='triangle', min_cell_
     mask = img_smoothed > thresh
     mask_cleaned = morphology.remove_small_objects(mask, min_size=min_cell_area)
     
-    # 2. distance transform multiplied by intensity to strongly bias peak detection towards the soma
+    # distance transform multiplied by intensity to strongly bias peak detection towards the soma
     distance = ndi.distance_transform_edt(mask_cleaned)
     weighted_topography = distance * img_smoothed
     
@@ -132,15 +128,15 @@ def segment_calcium_cells(img_tophat, original_img, method='triangle', min_cell_
     marker_mask[tuple(coords.T)] = True
     markers, _ = ndi.label(marker_mask)
     
-    # 3. watershed to cut touching dendrites/cells
+    # watershed to cut touching dendrites/cells
     cell_labels = segmentation.watershed(-weighted_topography, markers, mask=mask_cleaned)
     
-    # 4. locate the brightest central core of each label to set the elliptic/circular roi
+    # locate the brightest central core of each label to set the elliptic/circular roi
     soma_rois = []
     props = measure.regionprops(cell_labels, intensity_image=original_img)
     
     for prop in props:
-        # weighted_centroid pulls the coordinate exactly onto the brightest pixel of the body
+        # weighted_centroid pulls the coordinate onto the brightest pixel of the body
         y0, x0 = prop.weighted_centroid
         soma_rois.append({
             'id': prop.label,
@@ -155,17 +151,13 @@ def save_side_by_side_qc(img_raw, cell_labels, soma_rois, out_path, base_name):
     """plots the raw preprocessed image against the segmented masks and soma rois."""
     fig, axes = plt.subplots(1, 2, figsize=(14, 7))
     
-    # left: original visualization
-    # slightly equalize the visual display for human readability
     p2, p98 = np.percentile(img_raw, (2, 98))
     img_vis = exposure.rescale_intensity(img_raw, in_range=(p2, p98))
     
-    # use the fire-like inferno colormap instead of gray
     axes[0].imshow(img_vis, cmap='inferno')
     axes[0].set_title(f'{base_name} - raw input', fontweight='bold')
     axes[0].axis('off')
     
-    # right: segmentation and rois
     axes[1].imshow(img_vis, cmap='inferno')
     
     if cell_labels is not None and np.max(cell_labels) > 0:
@@ -175,7 +167,7 @@ def save_side_by_side_qc(img_raw, cell_labels, soma_rois, out_path, base_name):
         bound_rgba[boundaries] = [0, 1, 0, 0.7]  # green, alpha 0.7
         axes[1].imshow(bound_rgba)
         
-        # overlay red circular rois explicitly on the bright somas
+        # overlay red circular rois on the bright somas
         for roi in soma_rois:
             circ = mpatches.Circle(
                 (roi['x'], roi['y']), 
@@ -195,9 +187,6 @@ def save_side_by_side_qc(img_raw, cell_labels, soma_rois, out_path, base_name):
     fig.clf()
     plt.close('all')
 
-# ==========================================
-# PARALLEL WORKER ENGINE
-# ==========================================
 
 def _worker_process_timepoint(args):
     """isolated worker for handling a single calcium imaging timepoint."""
@@ -207,14 +196,13 @@ def _worker_process_timepoint(args):
     field = meta['field']
     time_point = meta['time']
     
-    # locate specific destination directory mapped earlier
     dest_dir = output_paths_dict.get((well, field))
     if not dest_dir: return None
     
     base_filename = os.path.basename(file_path).split('.')[0]
     out_img_path = os.path.join(dest_dir, f"t{time_point}_seg.png")
     
-    # bypass if already processed to allow easy resuming
+    # bypass if already processed to allow resuming
     if os.path.exists(out_img_path): return
     
     img_raw = load_as_float(file_path)
@@ -235,8 +223,6 @@ def _worker_process_timepoint(args):
     # generate qc visual
     save_side_by_side_qc(img_denoised, labels, soma_rois, out_img_path, base_filename)
     
-    # in the future, you could return the raw intensity values extracted from the roi mask here
-    # to append to a master dataframe for trace plotting over time
     return True
 
 def process_calcium_directory(
@@ -261,7 +247,7 @@ def process_calcium_directory(
         print("no valid calcium files found matching the regex pattern.")
         return
 
-    # prepare logical output structure based on discovered wells/fields
+    # prepare  output structure based on discovered wells/fields
     base_out_dir = os.path.dirname(data_dir)
     _, structure_dict = setup_dynamic_output(base_out_dir, [f[0] for f in target_files], "Output Calcium Segmentation")
     
@@ -286,12 +272,12 @@ def process_calcium_directory(
 # ==========================================
 
 if __name__ == "__main__":
-    # replace with your local data path
+
     data_path = r"C:/Users/lab/OneDrive - Vandria/Bureau/Calcium/Raw_Images"
     
     process_calcium_directory(
         data_dir=data_path,
-        target_channel="1",       # adjust based on which channel is fluo-4/gcamp etc.
+        target_channel="1",      
         threshold_method="otsu",  # triangle, li, or otsu
         tophat_radius=25,         # size of background rolling ball subtraction
         roi_radius=7              # size of the soma bounding circle for future trace extraction
