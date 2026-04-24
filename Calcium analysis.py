@@ -3,6 +3,8 @@ import re
 import glob
 import numpy as np
 import scipy.ndimage as ndi
+from scipy.spatial import distance
+from scipy.cluster import hierarchy
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -10,6 +12,7 @@ import matplotlib.patches as mpatches
 from skimage import io, filters, feature, exposure, morphology, segmentation, measure
 from tqdm import tqdm
 import concurrent.futures
+from collections import defaultdict
 
 # ==========================================
 # IO AND METADATA SETUP
@@ -115,15 +118,15 @@ def segment_calcium_cells(img_tophat, original_img, method='triangle', min_cell_
     mask_cleaned = morphology.remove_small_objects(mask, min_size=min_cell_area)
     
     # smoothing the distance to prevent false positives
-    distance = ndi.distance_transform_edt(mask_cleaned)
-    distance_smoothed = filters.gaussian(distance, sigma=2.0)
+    distance_img = ndi.distance_transform_edt(mask_cleaned)
+    distance_smoothed = filters.gaussian(distance_img, sigma=2.0)
     
     # topography balancing shape (distance) and signal (intensity)
     weighted_topography = distance_smoothed * img_smoothed
     
     # find regional maxima. min_distance dictates how close two somas can physically be before fusing.
     coords = feature.peak_local_max(weighted_topography, min_distance=min_distance, labels=mask_cleaned)
-    marker_mask = np.zeros(distance.shape, dtype=bool)
+    marker_mask = np.zeros(distance_img.shape, dtype=bool)
     marker_mask[tuple(coords.T)] = True
     markers, _ = ndi.label(marker_mask)
     
@@ -131,14 +134,12 @@ def segment_calcium_cells(img_tophat, original_img, method='triangle', min_cell_
     cell_labels = segmentation.watershed(-weighted_topography, markers, mask=mask_cleaned)
     
     # locate the brightest central core for the roi
-    # we use the non-clahe original_img here so the centroid reflects true calcium peaks
     soma_rois = []
     props = measure.regionprops(cell_labels, intensity_image=original_img)
     
     for prop in props:
         y0, x0 = prop.weighted_centroid
         soma_rois.append({
-            'id': prop.label,
             'y': int(y0),
             'x': int(x0),
             'radius': roi_radius
@@ -146,8 +147,8 @@ def segment_calcium_cells(img_tophat, original_img, method='triangle', min_cell_
         
     return cell_labels, soma_rois
 
-def save_side_by_side_qc(img_raw, cell_labels, soma_rois, out_path, base_name):
-    """plots the raw preprocessed image against the segmented masks and soma rois."""
+def save_side_by_side_qc(img_raw, cell_labels, stable_rois, out_path, base_name):
+    """plots the raw preprocessed image against the segmented masks and consensus stable rois."""
     fig, axes = plt.subplots(1, 2, figsize=(14, 7))
     
     p2, p98 = np.percentile(img_raw, (2, 98))
@@ -159,25 +160,27 @@ def save_side_by_side_qc(img_raw, cell_labels, soma_rois, out_path, base_name):
     
     axes[1].imshow(img_vis, cmap='inferno')
     
+    # plot the temporal boundaries of the current frame if they exist
     if cell_labels is not None and np.max(cell_labels) > 0:
         boundaries = segmentation.find_boundaries(cell_labels, mode='inner')
         bound_rgba = np.zeros((*img_vis.shape, 4), dtype=np.float32)
-        bound_rgba[boundaries] = [0, 1, 0, 0.5]  # green borders
+        bound_rgba[boundaries] = [0, 1, 0, 0.4]  # faint green borders for current activity
         axes[1].imshow(bound_rgba)
         
-        for roi in soma_rois:
-            circ = mpatches.Circle(
-                (roi['x'], roi['y']), 
-                radius=roi['radius'], 
-                fill=False, 
-                edgecolor='red', 
-                linewidth=1.2
-            )
-            axes[1].add_patch(circ)
-            # keeping labels small to prevent clutter in dense networks
-            axes[1].text(roi['x'] + roi['radius'], roi['y'] - roi['radius'], str(roi['id']), color='white', fontsize=6)
+    # plot the stable, cross-temporal rois
+    for roi in stable_rois:
+        circ = mpatches.Circle(
+            (roi['x'], roi['y']), 
+            radius=roi['radius'], 
+            fill=False, 
+            edgecolor='red', 
+            linewidth=1.5
+        )
+        axes[1].add_patch(circ)
+        # keeping labels small to prevent clutter in dense networks
+        axes[1].text(roi['x'] + roi['radius'], roi['y'] - roi['radius'], str(roi['id']), color='white', fontsize=7, fontweight='bold')
             
-    axes[1].set_title(f'segmented boundaries & soma rois ({len(soma_rois)} cells)', fontweight='bold')
+    axes[1].set_title(f'stable consensus rois ({len(stable_rois)} cells)', fontweight='bold')
     axes[1].axis('off')
     
     plt.tight_layout()
@@ -186,33 +189,79 @@ def save_side_by_side_qc(img_raw, cell_labels, soma_rois, out_path, base_name):
     plt.close('all')
 
 # ==========================================
+# CONSENSUS ROI TRACKING
+# ==========================================
+
+def compute_stable_rois_for_field(field_data, total_timepoints, presence_threshold=0.75, clustering_dist=10):
+    """
+    clusters all detected rois across timepoints to find consistent cells.
+    if a cell appears in at least (presence_threshold * 100)% of frames, it becomes a stable roi.
+    """
+    all_points = []
+    all_times = []
+    
+    # flatten the temporal data
+    for t_point, rois in field_data.items():
+        for r in rois:
+            all_points.append([r['x'], r['y']])
+            all_times.append(t_point)
+            
+    if not all_points:
+        return []
+        
+    all_points = np.array(all_points)
+    all_times = np.array(all_times)
+    
+    # hierarchical clustering based on spatial distance
+    if len(all_points) > 1:
+        dist_matrix = distance.pdist(all_points)
+        # complete linkage ensures all points in a cluster are within the threshold distance
+        z = hierarchy.linkage(dist_matrix, method='complete')
+        labels = hierarchy.fcluster(z, t=clustering_dist, criterion='distance')
+    else:
+        labels = np.array([1])
+        
+    stable_rois = []
+    roi_counter = 1
+    
+    unique_clusters = set(labels)
+    for cluster_id in unique_clusters:
+        idx = np.where(labels == cluster_id)[0]
+        cluster_times = all_times[idx]
+        
+        # count unique timepoints where this cluster was detected
+        unique_appearances = len(set(cluster_times))
+        
+        if (unique_appearances / total_timepoints) >= presence_threshold:
+            # calculate the average center position across all valid timepoints
+            cluster_pts = all_points[idx]
+            mean_x, mean_y = np.mean(cluster_pts, axis=0)
+            
+            stable_rois.append({
+                'id': roi_counter,
+                'x': int(mean_x),
+                'y': int(mean_y),
+                'radius': 6 # using default roi radius
+            })
+            roi_counter += 1
+            
+    return stable_rois
+
+# ==========================================
 # PARALLEL WORKER ENGINE
 # ==========================================
 
-def _worker_process_timepoint(args):
-    """isolated worker for handling a single calcium imaging timepoint."""
-    (file_path, meta, output_paths_dict, threshold_method, tophat_radius, roi_radius, min_soma_dist) = args
-    
-    well = meta['well']
-    field = meta['field']
-    time_point = meta['time']
-    
-    dest_dir = output_paths_dict.get((well, field))
-    if not dest_dir: return None
-    
-    base_filename = os.path.basename(file_path).split('.')[0]
-    out_img_path = os.path.join(dest_dir, f"t{time_point}_seg.png")
-    
-    if os.path.exists(out_img_path): return
+def _worker_extract_rois(args):
+    """pass 1: isolates rois for a single timepoint without plotting."""
+    (file_path, meta, threshold_method, tophat_radius, roi_radius, min_soma_dist) = args
     
     img_raw = load_as_float(file_path)
-    if img_raw is None or np.max(img_raw) == 0: return None
+    if img_raw is None or np.max(img_raw) == 0: 
+        return (meta, [])
         
-    # preprocess with clahe
     img_denoised, img_clahe, img_tophat = preprocess_image(img_raw, tophat_radius=tophat_radius)
     
-    # segment using clahe features but extract true peaks from the raw denoised image
-    labels, soma_rois = segment_calcium_cells(
+    _, soma_rois = segment_calcium_cells(
         img_tophat, 
         original_img=img_denoised, 
         method=threshold_method, 
@@ -221,7 +270,41 @@ def _worker_process_timepoint(args):
         min_distance=min_soma_dist
     )
     
-    save_side_by_side_qc(img_denoised, labels, soma_rois, out_img_path, base_filename)
+    return (meta, soma_rois)
+
+def _worker_plot_stable(args):
+    """pass 2: plots the original image but uses the fixed consensus rois."""
+    (file_path, meta, stable_rois, output_paths_dict, threshold_method, tophat_radius, roi_radius, min_soma_dist) = args
+    
+    well = meta['well']
+    field = meta['field']
+    time_point = meta['time']
+    
+    dest_dir = output_paths_dict.get((well, field))
+    if not dest_dir: return
+    
+    base_filename = os.path.basename(file_path).split('.')[0]
+    out_img_path = os.path.join(dest_dir, f"t{time_point}_seg.png")
+    
+    if os.path.exists(out_img_path): return
+    
+    img_raw = load_as_float(file_path)
+    if img_raw is None or np.max(img_raw) == 0: return
+        
+    img_denoised, img_clahe, img_tophat = preprocess_image(img_raw, tophat_radius=tophat_radius)
+    
+    # re-segment just to get the current frame's green boundaries for visual qc context
+    # (the red rois and ids will exclusively use the stable_rois)
+    cell_labels, _ = segment_calcium_cells(
+        img_tophat, 
+        original_img=img_denoised, 
+        method=threshold_method, 
+        min_cell_area=80, 
+        roi_radius=roi_radius,
+        min_distance=min_soma_dist
+    )
+    
+    save_side_by_side_qc(img_denoised, cell_labels, stable_rois, out_img_path, base_filename)
     return True
 
 def process_calcium_directory(
@@ -230,9 +313,10 @@ def process_calcium_directory(
     threshold_method="triangle",
     tophat_radius=20,
     roi_radius=6,
-    min_soma_dist=10
+    min_soma_dist=10,
+    presence_threshold=0.75
 ):
-    """master pipeline orchestrator."""
+    """master pipeline orchestrator (two-pass processing)."""
     search_pattern = os.path.join(data_dir, "*.[tT][iI][fF]*")
     all_files = glob.glob(search_pattern)
     
@@ -249,17 +333,53 @@ def process_calcium_directory(
     base_out_dir = os.path.dirname(data_dir)
     _, structure_dict = setup_dynamic_output(base_out_dir, [f[0] for f in target_files], "Output Calcium Segmentation")
     
-    tasks = []
-    for f_path, meta in target_files:
-        tasks.append((f_path, meta, structure_dict, threshold_method, tophat_radius, roi_radius, min_soma_dist))
-
     max_workers = os.cpu_count() if os.cpu_count() else 1
-    print(f"\nlaunching parallel extraction on {max_workers} cpu cores...")
+    print(f"\n[pass 1/2] extracting rois across {max_workers} cpu cores...")
+    
+    # group data by well and field to allow temporal analysis
+    field_temporal_data = defaultdict(lambda: defaultdict(list))
+    total_timepoints_per_field = defaultdict(set)
+    
+    extract_tasks = [
+        (f_path, meta, threshold_method, tophat_radius, roi_radius, min_soma_dist)
+        for f_path, meta in target_files
+    ]
     
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_worker_process_timepoint, t): t for t in tasks}
+        futures = {executor.submit(_worker_extract_rois, t): t for t in extract_tasks}
         
-        for _ in tqdm(concurrent.futures.as_completed(futures), total=len(tasks), desc="Processing Timepoints"):
+        for future in tqdm(concurrent.futures.as_completed(futures), total=len(extract_tasks), desc="extracting features"):
+            meta, soma_rois = future.result()
+            well_field_key = (meta['well'], meta['field'])
+            
+            field_temporal_data[well_field_key][meta['time']] = soma_rois
+            total_timepoints_per_field[well_field_key].add(meta['time'])
+            
+    print("\ncomputing consensus stable rois for each field...")
+    stable_rois_dict = {}
+    
+    for wf_key, time_data in field_temporal_data.items():
+        total_t = len(total_timepoints_per_field[wf_key])
+        stable_rois = compute_stable_rois_for_field(
+            time_data, 
+            total_timepoints=total_t, 
+            presence_threshold=presence_threshold,
+            clustering_dist=min_soma_dist
+        )
+        stable_rois_dict[wf_key] = stable_rois
+        print(f"  > {wf_key[0]} field {wf_key[1]}: found {len(stable_rois)} stable cells.")
+
+    print(f"\n[pass 2/2] plotting longitudinal qc images with fixed rois...")
+    plot_tasks = []
+    for f_path, meta in target_files:
+        wf_key = (meta['well'], meta['field'])
+        stable_rois = stable_rois_dict.get(wf_key, [])
+        plot_tasks.append((f_path, meta, stable_rois, structure_dict, threshold_method, tophat_radius, roi_radius, min_soma_dist))
+
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_worker_plot_stable, t): t for t in plot_tasks}
+        
+        for _ in tqdm(concurrent.futures.as_completed(futures), total=len(plot_tasks), desc="generating plots"):
             pass
             
     print("\ncalcium pipeline complete.")
@@ -277,5 +397,6 @@ if __name__ == "__main__":
         threshold_method="li",  
         tophat_radius=25,         
         roi_radius=6,             
-        min_soma_dist=10          
+        min_soma_dist=10,
+        presence_threshold=0.75   # parameter controlling temporal stability 
     )
