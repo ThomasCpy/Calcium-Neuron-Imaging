@@ -3,11 +3,8 @@ import re
 import glob
 import numpy as np
 import scipy.ndimage as ndi
-
-# force non-interactive backend to prevent tk thread crashes
 import matplotlib
 matplotlib.use('Agg')
-
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from skimage import io, filters, feature, exposure, morphology, segmentation, measure
@@ -93,8 +90,6 @@ def preprocess_image(img, tophat_radius=15):
     """cleans up noise, equalizes lighting locally, and flattens background"""
     img_denoised = filters.median(img, morphology.disk(1))
     
-    # clahe is critical here. it boosts dim cells so they survive global thresholding 
-    # without blowing out the already bright somas.
     img_clahe = exposure.equalize_adapthist(img_denoised, kernel_size=32, clip_limit=0.02)
     
     # tophat on the clahe image isolates the cells from any residual background gradients
@@ -109,7 +104,6 @@ def segment_calcium_cells(img_tophat, original_img, method='triangle', min_cell_
     """
     img_smoothed = filters.gaussian(img_tophat, sigma=1.0)
     
-    # 1. thresholding
     if method == 'triangle':
         thresh = filters.threshold_triangle(img_smoothed)
     elif method == 'li':
@@ -117,12 +111,10 @@ def segment_calcium_cells(img_tophat, original_img, method='triangle', min_cell_
     else:
         thresh = filters.threshold_otsu(img_smoothed)
         
-    # we relax the threshold slightly (80%) to catch faint dendrites
     mask = img_smoothed > (thresh * 0.8)
     mask_cleaned = morphology.remove_small_objects(mask, min_size=min_cell_area)
     
-    # 2. marker generation for watershed
-    # smoothing the distance transform slightly prevents false-positive peaks inside the same cell
+    # smoothing the distance to prevent false positives
     distance = ndi.distance_transform_edt(mask_cleaned)
     distance_smoothed = filters.gaussian(distance, sigma=2.0)
     
@@ -135,10 +127,10 @@ def segment_calcium_cells(img_tophat, original_img, method='triangle', min_cell_
     marker_mask[tuple(coords.T)] = True
     markers, _ = ndi.label(marker_mask)
     
-    # 3. watershed to cut touching dendrites
+    # watershed to cut touching dendrites
     cell_labels = segmentation.watershed(-weighted_topography, markers, mask=mask_cleaned)
     
-    # 4. locate the brightest central core for the roi
+    # locate the brightest central core for the roi
     # we use the non-clahe original_img here so the centroid reflects true calcium peaks
     soma_rois = []
     props = measure.regionprops(cell_labels, intensity_image=original_img)
@@ -277,7 +269,7 @@ def process_calcium_directory(
 # ==========================================
 
 if __name__ == "__main__":
-    data_path = r"C:/Users/lab/OneDrive - Vandria/Bureau/Calcium/Raw_Images"
+    data_path = r"C:/Users/lab/OneDrive - Vandria/Bureau/Calcium imaging/Pilot experiment"
     
     process_calcium_directory(
         data_dir=data_path,
