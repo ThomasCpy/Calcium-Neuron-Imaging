@@ -273,7 +273,7 @@ def process_calcium_directory(
 
 if __name__ == "__main__":
 
-    data_path = r"C:/Users/lab/OneDrive - Vandria/Bureau/Calcium/Raw_Images"
+    data_path = r"C:/Users/lab/OneDrive - Vandria/Bureau/Calcium imaging/Pilot experiment"
     
     process_calcium_directory(
         data_dir=data_path,
