@@ -3,8 +3,11 @@ import re
 import glob
 import numpy as np
 import scipy.ndimage as ndi
+
+# force non-interactive backend to prevent tk thread crashes
 import matplotlib
 matplotlib.use('Agg')
+
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from skimage import io, filters, feature, exposure, morphology, segmentation, measure
@@ -20,7 +23,6 @@ def parse_filename_metadata(filename):
     extracts time, well, field, and channel from the filename string.
     expected format pattern: ...t001G02f32d1...
     """
-    # regex to capture t(3 digits), well(letter+2 digits), f(2 digits), d(1 digit)
     pattern = re.compile(r't(\d{3})([A-H]\d{2})f(\d{2})d(\d)')
     match = pattern.search(filename)
     
@@ -37,7 +39,6 @@ def parse_filename_metadata(filename):
 def setup_dynamic_output(base_path, file_list, folder_name="Output Calcium"):
     """
     scans files to dynamically create the nested well > field folder structure.
-    returns a dictionary mapping (well, field) -> output_directory
     """
     output_dir = os.path.join(base_path, folder_name)
     os.makedirs(output_dir, exist_ok=True)
@@ -51,11 +52,9 @@ def setup_dynamic_output(base_path, file_list, folder_name="Output Calcium"):
         well = meta['well']
         field = meta['field']
         
-        # create well folder
         well_path = os.path.join(output_dir, well)
         os.makedirs(well_path, exist_ok=True)
         
-        # create field subfolder
         field_path = os.path.join(well_path, f"Field_{field}")
         os.makedirs(field_path, exist_ok=True)
         
@@ -81,33 +80,36 @@ def load_as_float(image_path):
     
     if img.dtype == np.uint8 or img_max <= 255:
         scale_factor = 255.0
-    elif img_max <= 4095:       # 12-bit camera
+    elif img_max <= 4095:       
         scale_factor = 4095.0
-    elif img_max <= 16383:      # 14-bit camera
+    elif img_max <= 16383:      
         scale_factor = 16383.0
-    else:                       # 16-bit camera
+    else:                       
         scale_factor = 65535.0
         
     return img.astype(np.float32) / scale_factor
 
 def preprocess_image(img, tophat_radius=15):
-    """cleans up noise and equalizes uneven illumination common in fluo imaging"""
-    # median filter for salt and pepper noise
+    """cleans up noise, equalizes lighting locally, and flattens background"""
     img_denoised = filters.median(img, morphology.disk(1))
     
-    # tophat subtracts background gradients
+    # clahe is critical here. it boosts dim cells so they survive global thresholding 
+    # without blowing out the already bright somas.
+    img_clahe = exposure.equalize_adapthist(img_denoised, kernel_size=32, clip_limit=0.02)
+    
+    # tophat on the clahe image isolates the cells from any residual background gradients
     selem = morphology.disk(tophat_radius)
-    img_tophat = morphology.white_tophat(img_denoised, footprint=selem)
+    img_tophat = morphology.white_tophat(img_clahe, footprint=selem)
     
-    return img_denoised, img_tophat
+    return img_denoised, img_clahe, img_tophat
 
-def segment_calcium_cells(img_tophat, original_img, method='triangle', min_cell_area=100, roi_radius=6):
+def segment_calcium_cells(img_tophat, original_img, method='triangle', min_cell_area=80, roi_radius=6, min_distance=10):
     """
-    uses watershed to separate close cells, weighting the distance by intensity.
-    extracts the high intensity soma center for roi placement.
+    uses clahe-enhanced inputs to segment highly heterogeneous calcium fields.
     """
-    img_smoothed = filters.gaussian(img_tophat, sigma=1.5)
+    img_smoothed = filters.gaussian(img_tophat, sigma=1.0)
     
+    # 1. thresholding
     if method == 'triangle':
         thresh = filters.threshold_triangle(img_smoothed)
     elif method == 'li':
@@ -115,28 +117,33 @@ def segment_calcium_cells(img_tophat, original_img, method='triangle', min_cell_
     else:
         thresh = filters.threshold_otsu(img_smoothed)
         
-    mask = img_smoothed > thresh
+    # we relax the threshold slightly (80%) to catch faint dendrites
+    mask = img_smoothed > (thresh * 0.8)
     mask_cleaned = morphology.remove_small_objects(mask, min_size=min_cell_area)
     
-    # distance transform multiplied by intensity to strongly bias peak detection towards the soma
+    # 2. marker generation for watershed
+    # smoothing the distance transform slightly prevents false-positive peaks inside the same cell
     distance = ndi.distance_transform_edt(mask_cleaned)
-    weighted_topography = distance * img_smoothed
+    distance_smoothed = filters.gaussian(distance, sigma=2.0)
     
-    # find regional maxima (soma centers)
-    coords = feature.peak_local_max(weighted_topography, min_distance=15, labels=mask_cleaned)
+    # topography balancing shape (distance) and signal (intensity)
+    weighted_topography = distance_smoothed * img_smoothed
+    
+    # find regional maxima. min_distance dictates how close two somas can physically be before fusing.
+    coords = feature.peak_local_max(weighted_topography, min_distance=min_distance, labels=mask_cleaned)
     marker_mask = np.zeros(distance.shape, dtype=bool)
     marker_mask[tuple(coords.T)] = True
     markers, _ = ndi.label(marker_mask)
     
-    # watershed to cut touching dendrites/cells
+    # 3. watershed to cut touching dendrites
     cell_labels = segmentation.watershed(-weighted_topography, markers, mask=mask_cleaned)
     
-    # locate the brightest central core of each label to set the elliptic/circular roi
+    # 4. locate the brightest central core for the roi
+    # we use the non-clahe original_img here so the centroid reflects true calcium peaks
     soma_rois = []
     props = measure.regionprops(cell_labels, intensity_image=original_img)
     
     for prop in props:
-        # weighted_centroid pulls the coordinate onto the brightest pixel of the body
         y0, x0 = prop.weighted_centroid
         soma_rois.append({
             'id': prop.label,
@@ -161,23 +168,22 @@ def save_side_by_side_qc(img_raw, cell_labels, soma_rois, out_path, base_name):
     axes[1].imshow(img_vis, cmap='inferno')
     
     if cell_labels is not None and np.max(cell_labels) > 0:
-        # overlay green borders for the entire cellular region (dendrites + body)
         boundaries = segmentation.find_boundaries(cell_labels, mode='inner')
         bound_rgba = np.zeros((*img_vis.shape, 4), dtype=np.float32)
-        bound_rgba[boundaries] = [0, 1, 0, 0.7]  # green, alpha 0.7
+        bound_rgba[boundaries] = [0, 1, 0, 0.5]  # green borders
         axes[1].imshow(bound_rgba)
         
-        # overlay red circular rois on the bright somas
         for roi in soma_rois:
             circ = mpatches.Circle(
                 (roi['x'], roi['y']), 
                 radius=roi['radius'], 
                 fill=False, 
                 edgecolor='red', 
-                linewidth=1.5
+                linewidth=1.2
             )
             axes[1].add_patch(circ)
-            axes[1].text(roi['x'] + roi['radius'], roi['y'] - roi['radius'], str(roi['id']), color='red', fontsize=8)
+            # keeping labels small to prevent clutter in dense networks
+            axes[1].text(roi['x'] + roi['radius'], roi['y'] - roi['radius'], str(roi['id']), color='white', fontsize=6)
             
     axes[1].set_title(f'segmented boundaries & soma rois ({len(soma_rois)} cells)', fontweight='bold')
     axes[1].axis('off')
@@ -187,10 +193,13 @@ def save_side_by_side_qc(img_raw, cell_labels, soma_rois, out_path, base_name):
     fig.clf()
     plt.close('all')
 
+# ==========================================
+# PARALLEL WORKER ENGINE
+# ==========================================
 
 def _worker_process_timepoint(args):
     """isolated worker for handling a single calcium imaging timepoint."""
-    (file_path, meta, output_paths_dict, threshold_method, tophat_radius, roi_radius) = args
+    (file_path, meta, output_paths_dict, threshold_method, tophat_radius, roi_radius, min_soma_dist) = args
     
     well = meta['well']
     field = meta['field']
@@ -202,27 +211,25 @@ def _worker_process_timepoint(args):
     base_filename = os.path.basename(file_path).split('.')[0]
     out_img_path = os.path.join(dest_dir, f"t{time_point}_seg.png")
     
-    # bypass if already processed to allow resuming
     if os.path.exists(out_img_path): return
     
     img_raw = load_as_float(file_path)
     if img_raw is None or np.max(img_raw) == 0: return None
         
-    # preprocess and isolate background
-    img_denoised, img_tophat = preprocess_image(img_raw, tophat_radius=tophat_radius)
+    # preprocess with clahe
+    img_denoised, img_clahe, img_tophat = preprocess_image(img_raw, tophat_radius=tophat_radius)
     
-    # extract cells and bodies
+    # segment using clahe features but extract true peaks from the raw denoised image
     labels, soma_rois = segment_calcium_cells(
         img_tophat, 
         original_img=img_denoised, 
         method=threshold_method, 
-        min_cell_area=150, 
-        roi_radius=roi_radius
+        min_cell_area=80, 
+        roi_radius=roi_radius,
+        min_distance=min_soma_dist
     )
     
-    # generate qc visual
     save_side_by_side_qc(img_denoised, labels, soma_rois, out_img_path, base_filename)
-    
     return True
 
 def process_calcium_directory(
@@ -230,13 +237,13 @@ def process_calcium_directory(
     target_channel="1", 
     threshold_method="triangle",
     tophat_radius=20,
-    roi_radius=6
+    roi_radius=6,
+    min_soma_dist=10
 ):
     """master pipeline orchestrator."""
     search_pattern = os.path.join(data_dir, "*.[tT][iI][fF]*")
     all_files = glob.glob(search_pattern)
     
-    # filter files by target calcium channel using regex
     target_files = []
     for f in all_files:
         meta = parse_filename_metadata(os.path.basename(f))
@@ -247,15 +254,13 @@ def process_calcium_directory(
         print("no valid calcium files found matching the regex pattern.")
         return
 
-    # prepare  output structure based on discovered wells/fields
     base_out_dir = os.path.dirname(data_dir)
     _, structure_dict = setup_dynamic_output(base_out_dir, [f[0] for f in target_files], "Output Calcium Segmentation")
     
     tasks = []
     for f_path, meta in target_files:
-        tasks.append((f_path, meta, structure_dict, threshold_method, tophat_radius, roi_radius))
+        tasks.append((f_path, meta, structure_dict, threshold_method, tophat_radius, roi_radius, min_soma_dist))
 
-    # deploying multiprocessing 
     max_workers = os.cpu_count() if os.cpu_count() else 1
     print(f"\nlaunching parallel extraction on {max_workers} cpu cores...")
     
@@ -272,13 +277,13 @@ def process_calcium_directory(
 # ==========================================
 
 if __name__ == "__main__":
-
-    data_path = r"C:/Users/lab/OneDrive - Vandria/Bureau/Calcium imaging/Pilot experiment"
+    data_path = r"C:/Users/lab/OneDrive - Vandria/Bureau/Calcium/Raw_Images"
     
     process_calcium_directory(
         data_dir=data_path,
-        target_channel="1",      
-        threshold_method="otsu",  # triangle, li, or otsu
-        tophat_radius=25,         # size of background rolling ball subtraction
-        roi_radius=7              # size of the soma bounding circle for future trace extraction
+        target_channel="1",       
+        threshold_method="li",  
+        tophat_radius=25,         
+        roi_radius=6,             
+        min_soma_dist=10          
     )
