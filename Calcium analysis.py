@@ -5,10 +5,13 @@ import numpy as np
 import scipy.ndimage as ndi
 from scipy.spatial import distance
 from scipy.cluster import hierarchy
+import scipy.signal as signal
+import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import seaborn as sns
 from skimage import io, filters, feature, exposure, morphology, segmentation, measure
 from tqdm import tqdm
 import concurrent.futures
@@ -29,7 +32,7 @@ def parse_filename_metadata(filename):
     if match:
         t_point, well, field, channel = match.groups()
         return {
-            'time': t_point,
+            'time': int(t_point), # cast to int for easier sorting later
             'well': well,
             'field': field,
             'channel': channel
@@ -147,6 +150,25 @@ def segment_calcium_cells(img_tophat, original_img, method='triangle', min_cell_
         
     return cell_labels, soma_rois
 
+def extract_roi_intensities(img, rois):
+    """
+    extracts the mean pixel intensity for each defined roi from the provided image.
+    we use the raw denoised image here to preserve linear fluorescence dynamics.
+    """
+    intensities = {}
+    h, w = img.shape
+    y_grid, x_grid = np.ogrid[:h, :w]
+    
+    for roi in rois:
+        # create circular mask for the roi
+        mask = ((y_grid - roi['y'])**2 + (x_grid - roi['x'])**2) <= roi['radius']**2
+        if np.any(mask):
+            intensities[roi['id']] = np.mean(img[mask])
+        else:
+            intensities[roi['id']] = 0.0
+            
+    return intensities
+
 def save_side_by_side_qc(img_raw, cell_labels, stable_rois, out_path, base_name):
     """plots the raw preprocessed image against the segmented masks and consensus stable rois."""
     fig, axes = plt.subplots(1, 2, figsize=(14, 7))
@@ -189,6 +211,95 @@ def save_side_by_side_qc(img_raw, cell_labels, stable_rois, out_path, base_name)
     plt.close('all')
 
 # ==========================================
+# SIGNAL PROCESSING & TRACE ANALYSIS
+# ==========================================
+
+def calculate_df_f0(trace, window=20):
+    """
+    calculates delta f / f0. 
+    uses a rolling percentile to handle slow photobleaching without killing peaks.
+    """
+    trace_array = np.array(trace)
+    # use 20th percentile as baseline (f0)
+    f0 = ndi.percentile_filter(trace_array, percentile=20, size=window)
+    # prevent division by zero
+    f0[f0 == 0] = np.nan 
+    df_f0 = (trace_array - f0) / f0
+    return df_f0
+
+def analyze_traces_and_plot(well_field_data, stable_rois, dest_dir, well, field, fps=1.0):
+    """
+    sorts temporal data, extracts delta f / f0, finds peaks, and plots trace grids.
+    returns a list of dictionaries with stats per cell.
+    """
+    timepoints = sorted(list(well_field_data.keys()))
+    if not timepoints: return []
+    
+    cell_stats = []
+    
+    # setup trace plot grid
+    n_cells = len(stable_rois)
+    cols = int(np.ceil(np.sqrt(n_cells)))
+    rows = int(np.ceil(n_cells / cols)) if cols > 0 else 1
+    
+    fig, axes = plt.subplots(rows, cols, figsize=(cols*4, rows*2.5), sharex=True)
+    if n_cells == 1: axes = np.array([axes])
+    axes = axes.flatten() if isinstance(axes, np.ndarray) else np.array([axes])
+    
+    for i, roi in enumerate(stable_rois):
+        roi_id = roi['id']
+        raw_trace = [well_field_data[t].get(roi_id, np.nan) for t in timepoints]
+        
+        # interpolate missing data if a frame extraction failed
+        s = pd.Series(raw_trace)
+        s = s.interpolate(method='linear').bfill().ffill()
+        raw_trace = s.values
+        
+        df_f0 = calculate_df_f0(raw_trace)
+        
+        # find peaks (prominence threshold filters out noise ripples)
+        peaks, properties = signal.find_peaks(df_f0, prominence=0.1, distance=3)
+        
+        freq = len(peaks) / (len(timepoints) / fps) # peaks per second
+        # amplitude: average peak height relative to baseline, or max-min if no peaks
+        if len(peaks) > 0:
+            amp = np.mean(df_f0[peaks])
+        else:
+            amp = np.nanmax(df_f0) - np.nanmin(df_f0)
+            
+        cell_stats.append({
+            'well': well,
+            'field': field,
+            'roi_id': roi_id,
+            'frequency_hz': freq,
+            'amplitude_df_f0': amp
+        })
+        
+        # plot trace
+        ax = axes[i]
+        t_sec = np.array(timepoints) / fps
+        ax.plot(t_sec, df_f0, color='dodgerblue', lw=1.5)
+        ax.plot(t_sec[peaks], df_f0[peaks], 'x', color='crimson')
+        ax.set_title(f"Cell {roi_id}", fontsize=9)
+        if i >= len(axes) - cols:
+            ax.set_xlabel("Time (s)", fontsize=8)
+        if i % cols == 0:
+            ax.set_ylabel(r"$\Delta F/F_0$", fontsize=8)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        
+    # clean up empty subplots
+    for j in range(i + 1, len(axes)):
+        fig.delaxes(axes[j])
+        
+    plt.tight_layout()
+    out_path = os.path.join(dest_dir, f"{well}_Field{field}_traces.png")
+    plt.savefig(out_path, dpi=150)
+    plt.close(fig)
+    
+    return cell_stats
+
+# ==========================================
 # CONSENSUS ROI TRACKING
 # ==========================================
 
@@ -215,7 +326,6 @@ def compute_stable_rois_for_field(field_data, total_timepoints, presence_thresho
     # hierarchical clustering based on spatial distance
     if len(all_points) > 1:
         dist_matrix = distance.pdist(all_points)
-        # complete linkage ensures all points in a cluster are within the threshold distance
         z = hierarchy.linkage(dist_matrix, method='complete')
         labels = hierarchy.fcluster(z, t=clustering_dist, criterion='distance')
     else:
@@ -229,11 +339,9 @@ def compute_stable_rois_for_field(field_data, total_timepoints, presence_thresho
         idx = np.where(labels == cluster_id)[0]
         cluster_times = all_times[idx]
         
-        # count unique timepoints where this cluster was detected
         unique_appearances = len(set(cluster_times))
         
         if (unique_appearances / total_timepoints) >= presence_threshold:
-            # calculate the average center position across all valid timepoints
             cluster_pts = all_points[idx]
             mean_x, mean_y = np.mean(cluster_pts, axis=0)
             
@@ -241,7 +349,7 @@ def compute_stable_rois_for_field(field_data, total_timepoints, presence_thresho
                 'id': roi_counter,
                 'x': int(mean_x),
                 'y': int(mean_y),
-                'radius': 6 # using default roi radius
+                'radius': 6 
             })
             roi_counter += 1
             
@@ -272,8 +380,8 @@ def _worker_extract_rois(args):
     
     return (meta, soma_rois)
 
-def _worker_plot_stable(args):
-    """pass 2: plots the original image but uses the fixed consensus rois."""
+def _worker_process_frame(args):
+    """pass 2: plots stable rois and extracts raw intensity for this frame."""
     (file_path, meta, stable_rois, output_paths_dict, threshold_method, tophat_radius, roi_radius, min_soma_dist) = args
     
     well = meta['well']
@@ -281,42 +389,44 @@ def _worker_plot_stable(args):
     time_point = meta['time']
     
     dest_dir = output_paths_dict.get((well, field))
-    if not dest_dir: return
+    if not dest_dir: return None
     
     base_filename = os.path.basename(file_path).split('.')[0]
-    out_img_path = os.path.join(dest_dir, f"t{time_point}_seg.png")
-    
-    if os.path.exists(out_img_path): return
+    out_img_path = os.path.join(dest_dir, f"t{time_point:03d}_seg.png")
     
     img_raw = load_as_float(file_path)
-    if img_raw is None or np.max(img_raw) == 0: return
+    if img_raw is None or np.max(img_raw) == 0: return None
         
     img_denoised, img_clahe, img_tophat = preprocess_image(img_raw, tophat_radius=tophat_radius)
     
-    # re-segment just to get the current frame's green boundaries for visual qc context
-    # (the red rois and ids will exclusively use the stable_rois)
-    cell_labels, _ = segment_calcium_cells(
-        img_tophat, 
-        original_img=img_denoised, 
-        method=threshold_method, 
-        min_cell_area=80, 
-        roi_radius=roi_radius,
-        min_distance=min_soma_dist
-    )
+    # extract intensity from raw denoised image
+    intensities = extract_roi_intensities(img_denoised, stable_rois)
     
-    save_side_by_side_qc(img_denoised, cell_labels, stable_rois, out_img_path, base_filename)
-    return True
+    if not os.path.exists(out_img_path):
+        cell_labels, _ = segment_calcium_cells(
+            img_tophat, 
+            original_img=img_denoised, 
+            method=threshold_method, 
+            min_cell_area=80, 
+            roi_radius=roi_radius,
+            min_distance=min_soma_dist
+        )
+        save_side_by_side_qc(img_denoised, cell_labels, stable_rois, out_img_path, base_filename)
+        
+    return (well, field, time_point, intensities)
 
 def process_calcium_directory(
     data_dir, 
+    condition_map,
     target_channel="1", 
     threshold_method="triangle",
     tophat_radius=20,
     roi_radius=6,
     min_soma_dist=10,
-    presence_threshold=0.75
+    presence_threshold=0.75,
+    acquisition_fps=1.0
 ):
-    """master pipeline orchestrator (two-pass processing)."""
+    """master pipeline orchestrator."""
     search_pattern = os.path.join(data_dir, "*.[tT][iI][fF]*")
     all_files = glob.glob(search_pattern)
     
@@ -331,58 +441,102 @@ def process_calcium_directory(
         return
 
     base_out_dir = os.path.dirname(data_dir)
-    _, structure_dict = setup_dynamic_output(base_out_dir, [f[0] for f in target_files], "Output Calcium Segmentation")
+    stats_out_dir, structure_dict = setup_dynamic_output(base_out_dir, [f[0] for f in target_files], "Output Calcium Analysis")
     
     max_workers = os.cpu_count() if os.cpu_count() else 1
-    print(f"\n[pass 1/2] extracting rois across {max_workers} cpu cores...")
     
-    # group data by well and field to allow temporal analysis
-    field_temporal_data = defaultdict(lambda: defaultdict(list))
+    # ---------------------------------------------------------
+    # PASS 1: segment every frame to find physical cell locations
+    # ---------------------------------------------------------
+    print(f"\n[pass 1/3] extracting dynamic rois across {max_workers} cpu cores...")
+    field_temporal_rois = defaultdict(lambda: defaultdict(list))
     total_timepoints_per_field = defaultdict(set)
     
-    extract_tasks = [
-        (f_path, meta, threshold_method, tophat_radius, roi_radius, min_soma_dist)
-        for f_path, meta in target_files
-    ]
+    extract_tasks = [(f_path, meta, threshold_method, tophat_radius, roi_radius, min_soma_dist) for f_path, meta in target_files]
     
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(_worker_extract_rois, t): t for t in extract_tasks}
-        
-        for future in tqdm(concurrent.futures.as_completed(futures), total=len(extract_tasks), desc="extracting features"):
+        for future in tqdm(concurrent.futures.as_completed(futures), total=len(extract_tasks), desc="segmenting"):
             meta, soma_rois = future.result()
             well_field_key = (meta['well'], meta['field'])
-            
-            field_temporal_data[well_field_key][meta['time']] = soma_rois
+            field_temporal_rois[well_field_key][meta['time']] = soma_rois
             total_timepoints_per_field[well_field_key].add(meta['time'])
             
+    # ---------------------------------------------------------
+    # CONSENSUS: define stable cells
+    # ---------------------------------------------------------
     print("\ncomputing consensus stable rois for each field...")
     stable_rois_dict = {}
-    
-    for wf_key, time_data in field_temporal_data.items():
+    for wf_key, time_data in field_temporal_rois.items():
         total_t = len(total_timepoints_per_field[wf_key])
-        stable_rois = compute_stable_rois_for_field(
-            time_data, 
-            total_timepoints=total_t, 
-            presence_threshold=presence_threshold,
-            clustering_dist=min_soma_dist
-        )
+        stable_rois = compute_stable_rois_for_field(time_data, total_timepoints=total_t, presence_threshold=presence_threshold, clustering_dist=min_soma_dist)
         stable_rois_dict[wf_key] = stable_rois
         print(f"  > {wf_key[0]} field {wf_key[1]}: found {len(stable_rois)} stable cells.")
 
-    print(f"\n[pass 2/2] plotting longitudinal qc images with fixed rois...")
+    # ---------------------------------------------------------
+    # PASS 2: extract trace intensities and save qc images
+    # ---------------------------------------------------------
+    print(f"\n[pass 2/3] extracting raw intensities and plotting qc masks...")
     plot_tasks = []
     for f_path, meta in target_files:
         wf_key = (meta['well'], meta['field'])
         stable_rois = stable_rois_dict.get(wf_key, [])
         plot_tasks.append((f_path, meta, stable_rois, structure_dict, threshold_method, tophat_radius, roi_radius, min_soma_dist))
 
+    # nested dict to hold time series data: traces_data[well][field][time][roi_id] = intensity
+    traces_data = defaultdict(lambda: defaultdict(dict))
+    
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_worker_plot_stable, t): t for t in plot_tasks}
-        
-        for _ in tqdm(concurrent.futures.as_completed(futures), total=len(plot_tasks), desc="generating plots"):
-            pass
+        futures = {executor.submit(_worker_process_frame, t): t for t in plot_tasks}
+        for future in tqdm(concurrent.futures.as_completed(futures), total=len(plot_tasks), desc="processing signals"):
+            result = future.result()
+            if result:
+                well, field, t_point, intensities = result
+                traces_data[well][field][t_point] = intensities
+
+    # ---------------------------------------------------------
+    # PASS 3: process signals, plot traces, and aggregate stats
+    # ---------------------------------------------------------
+    print(f"\n[pass 3/3] computing df/f0, finding peaks, and generating statistics...")
+    all_cell_stats = []
+    
+    for well, fields in traces_data.items():
+        for field, time_data in fields.items():
+            dest_dir = structure_dict[(well, field)]
+            stable_rois = stable_rois_dict[(well, field)]
             
-    print("\ncalcium pipeline complete.")
+            stats = analyze_traces_and_plot(time_data, stable_rois, dest_dir, well, field, fps=acquisition_fps)
+            all_cell_stats.extend(stats)
+            
+    # compile into dataframe and generate violin plots
+    if all_cell_stats:
+        df_stats = pd.DataFrame(all_cell_stats)
+        # map well to experimental condition (fallback to well name if not in map)
+        df_stats['condition'] = df_stats['well'].map(lambda w: condition_map.get(w, w))
+        
+        csv_path = os.path.join(stats_out_dir, "calcium_cell_statistics.csv")
+        df_stats.to_csv(csv_path, index=False)
+        
+        # violin plots for frequency and amplitude
+        fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+        
+        sns.violinplot(data=df_stats, x='condition', y='frequency_hz', ax=axes[0], palette='pastel', inner="quartile")
+        sns.stripplot(data=df_stats, x='condition', y='frequency_hz', ax=axes[0], color='black', alpha=0.5, size=3)
+        axes[0].set_title('Oscillation Frequency by Condition')
+        axes[0].set_ylabel('Frequency (Hz)')
+        axes[0].tick_params(axis='x', rotation=45)
+        
+        sns.violinplot(data=df_stats, x='condition', y='amplitude_df_f0', ax=axes[1], palette='pastel', inner="quartile")
+        sns.stripplot(data=df_stats, x='condition', y='amplitude_df_f0', ax=axes[1], color='black', alpha=0.5, size=3)
+        axes[1].set_title('Oscillation Amplitude by Condition')
+        axes[1].set_ylabel(r'Amplitude ($\Delta F/F_0$)')
+        axes[1].tick_params(axis='x', rotation=45)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(stats_out_dir, "population_violin_plots.png"), dpi=200)
+        plt.close()
+        
+    print(f"\ncalcium pipeline complete. output saved to: {stats_out_dir}")
 
 # ==========================================
 # EXECUTION
@@ -391,12 +545,23 @@ def process_calcium_directory(
 if __name__ == "__main__":
     data_path = r"C:/Users/lab/OneDrive - Vandria/Bureau/Calcium imaging/Pilot experiment"
     
+    # user maps wells to conditions here for the violin plots
+    exp_condition_map = {
+        'A01': 'Control',
+        'A02': 'Control',
+        'B01': 'Treatment X',
+        'B02': 'Treatment X',
+        # any well not listed will just show up as its well name (e.g., 'C01')
+    }
+    
     process_calcium_directory(
         data_dir=data_path,
+        condition_map=exp_condition_map,
         target_channel="1",       
         threshold_method="li",  
         tophat_radius=25,         
         roi_radius=6,             
         min_soma_dist=10,
-        presence_threshold=0.75   # parameter controlling temporal stability 
+        presence_threshold=0.75,
+        acquisition_fps=1.0       
     )
