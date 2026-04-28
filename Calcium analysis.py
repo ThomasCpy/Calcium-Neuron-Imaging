@@ -227,24 +227,24 @@ def calculate_df_f0(trace, window=20):
     df_f0 = (trace_array - f0) / f0
     return df_f0
 
-def analyze_traces_and_plot(well_field_data, stable_rois, dest_dir, well, field, fps=1.0):
+def analyze_traces_and_plot(well_field_data, stable_rois, dest_dir, well, field, fps=1.0, peak_prominence=0.1, peak_distance=3):
     """
-    sorts temporal data, extracts delta f / f0, finds peaks, and plots trace grids.
+    sorts temporal data, extracts raw and delta f / f0, finds peaks, 
+    and plots all cells overlapped side-by-side (raw vs normalized) to check compensation.
     returns a list of dictionaries with stats per cell.
     """
     timepoints = sorted(list(well_field_data.keys()))
     if not timepoints: return []
     
     cell_stats = []
-    
-    # setup trace plot grid
     n_cells = len(stable_rois)
-    cols = int(np.ceil(np.sqrt(n_cells)))
-    rows = int(np.ceil(n_cells / cols)) if cols > 0 else 1
     
-    fig, axes = plt.subplots(rows, cols, figsize=(cols*4, rows*2.5), sharex=True)
-    if n_cells == 1: axes = np.array([axes])
-    axes = axes.flatten() if isinstance(axes, np.ndarray) else np.array([axes])
+    # setup trace plot: 1 row, 2 columns
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5), sharex=True)
+    
+    t_sec = np.array(timepoints) / fps
+    # generate a color palette for the cells so overlapping lines are distinguishable
+    colors = plt.cm.viridis(np.linspace(0, 1, n_cells))
     
     for i, roi in enumerate(stable_rois):
         roi_id = roi['id']
@@ -258,7 +258,7 @@ def analyze_traces_and_plot(well_field_data, stable_rois, dest_dir, well, field,
         df_f0 = calculate_df_f0(raw_trace)
         
         # find peaks (prominence threshold filters out noise ripples)
-        peaks, properties = signal.find_peaks(df_f0, prominence=0.1, distance=3)
+        peaks, properties = signal.find_peaks(df_f0, prominence=peak_prominence, distance=peak_distance)
         
         freq = len(peaks) / (len(timepoints) / fps) # peaks per second
         # amplitude: average peak height relative to baseline, or max-min if no peaks
@@ -275,22 +275,23 @@ def analyze_traces_and_plot(well_field_data, stable_rois, dest_dir, well, field,
             'amplitude_df_f0': amp
         })
         
-        # plot trace
-        ax = axes[i]
-        t_sec = np.array(timepoints) / fps
-        ax.plot(t_sec, df_f0, color='dodgerblue', lw=1.5)
-        ax.plot(t_sec[peaks], df_f0[peaks], 'x', color='crimson')
-        ax.set_title(f"Cell {roi_id}", fontsize=9)
-        if i >= len(axes) - cols:
-            ax.set_xlabel("Time (s)", fontsize=8)
-        if i % cols == 0:
-            ax.set_ylabel(r"$\Delta F/F_0$", fontsize=8)
-        ax.spines['top'].set_visible(False)
-        ax.spines['right'].set_visible(False)
+        # plot raw trace overlapped
+        axes[0].plot(t_sec, raw_trace, color=colors[i], lw=1.2, alpha=0.7)
         
-    # clean up empty subplots
-    for j in range(i + 1, len(axes)):
-        fig.delaxes(axes[j])
+        # plot normalized trace overlapped
+        axes[1].plot(t_sec, df_f0, color=colors[i], lw=1.2, alpha=0.7)
+        
+    axes[0].set_title(f"{well} Field {field} - raw fluorescence", fontweight='bold')
+    axes[0].set_ylabel("raw intensity (a.u.)")
+    axes[0].set_xlabel("time (s)")
+    axes[0].spines['top'].set_visible(False)
+    axes[0].spines['right'].set_visible(False)
+    
+    axes[1].set_title(f"{well} Field {field} - $\Delta F/F_0$ (normalized)", fontweight='bold')
+    axes[1].set_ylabel(r"$\Delta F/F_0$")
+    axes[1].set_xlabel("time (s)")
+    axes[1].spines['top'].set_visible(False)
+    axes[1].spines['right'].set_visible(False)
         
     plt.tight_layout()
     out_path = os.path.join(dest_dir, f"{well}_Field{field}_traces.png")
@@ -424,7 +425,9 @@ def process_calcium_directory(
     roi_radius=6,
     min_soma_dist=10,
     presence_threshold=0.75,
-    acquisition_fps=1.0
+    acquisition_fps=1.0,
+    peak_prominence=0.1,
+    peak_distance=3
 ):
     """master pipeline orchestrator."""
     search_pattern = os.path.join(data_dir, "*.[tT][iI][fF]*")
@@ -505,7 +508,12 @@ def process_calcium_directory(
             dest_dir = structure_dict[(well, field)]
             stable_rois = stable_rois_dict[(well, field)]
             
-            stats = analyze_traces_and_plot(time_data, stable_rois, dest_dir, well, field, fps=acquisition_fps)
+            stats = analyze_traces_and_plot(
+                time_data, stable_rois, dest_dir, well, field, 
+                fps=acquisition_fps, 
+                peak_prominence=peak_prominence, 
+                peak_distance=peak_distance
+            )
             all_cell_stats.extend(stats)
             
     # compile into dataframe and generate violin plots
@@ -563,5 +571,7 @@ if __name__ == "__main__":
         roi_radius=6,             
         min_soma_dist=10,
         presence_threshold=0.75,
-        acquisition_fps=1.0       
+        acquisition_fps=1.0,      # change to your actual camera frame rate (hz)
+        peak_prominence=0.1,      # min height above baseline to count as a true calcium peak
+        peak_distance=3           # min frames between spikes to prevent double counting noise
     )
