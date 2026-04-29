@@ -622,24 +622,34 @@ def process_calcium_directory(
         csv_path = os.path.join(stats_out_dir, "calcium_cell_statistics.csv")
         df_stats.to_csv(csv_path, index=False)
         
-        # violin plots for frequency and amplitude
-        fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+        # generate separate violin plots with statistical testing
+        metrics = {
+            'frequency_hz': ('Oscillation Frequency by Condition', 'Frequency (Hz)', 'frequency_violin.png'),
+            'amplitude_df_f0': ('Oscillation Amplitude by Condition', r'Amplitude ($\Delta F/F_0$)', 'amplitude_violin.png'),
+            'auc': ('Area Under the Curve (AUC) by Condition', 'AUC (a.u. * s)', 'auc_violin.png')
+        }
         
-        sns.violinplot(data=df_stats, x='condition', y='frequency_hz', ax=axes[0], palette='pastel', inner="quartile")
-        sns.stripplot(data=df_stats, x='condition', y='frequency_hz', ax=axes[0], color='black', alpha=0.5, size=3)
-        axes[0].set_title('Oscillation Frequency by Condition')
-        axes[0].set_ylabel('Frequency (Hz)')
-        axes[0].tick_params(axis='x', rotation=45)
-        
-        sns.violinplot(data=df_stats, x='condition', y='amplitude_df_f0', ax=axes[1], palette='pastel', inner="quartile")
-        sns.stripplot(data=df_stats, x='condition', y='amplitude_df_f0', ax=axes[1], color='black', alpha=0.5, size=3)
-        axes[1].set_title('Oscillation Amplitude by Condition')
-        axes[1].set_ylabel(r'Amplitude ($\Delta F/F_0$)')
-        axes[1].tick_params(axis='x', rotation=45)
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(stats_out_dir, "population_violin_plots.png"), dpi=200)
-        plt.close()
+        for col, (title, ylabel, filename) in metrics.items():
+            fig, ax = plt.subplots(figsize=(8, 6))
+            sns.violinplot(data=df_stats, x='condition', y=col, ax=ax, palette='pastel', inner="quartile")
+            sns.stripplot(data=df_stats, x='condition', y=col, ax=ax, color='black', alpha=0.5, size=3)
+            
+            # calculate non-parametric statistics (Kruskal-Wallis) across conditions
+            conditions = df_stats['condition'].unique()
+            if len(conditions) > 1:
+                groups = [df_stats[df_stats['condition'] == cond][col].dropna() for cond in conditions]
+                groups = [g for g in groups if len(g) > 0] # filter empty groups
+                if len(groups) > 1:
+                    stat, pval = stats.kruskal(*groups)
+                    title += f'\n(Kruskal-Wallis p-value: {pval:.4g})'
+            
+            ax.set_title(title)
+            ax.set_ylabel(ylabel)
+            ax.tick_params(axis='x', rotation=45)
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(stats_out_dir, filename), dpi=200)
+            plt.close(fig)
         
     print(f"\ncalcium pipeline complete. output saved to: {stats_out_dir}")
 
