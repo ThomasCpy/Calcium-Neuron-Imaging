@@ -16,6 +16,7 @@ from skimage import io, filters, feature, exposure, morphology, segmentation, me
 from tqdm import tqdm
 import concurrent.futures
 from collections import defaultdict
+import roifile
 
 # ==========================================
 # IO AND METADATA SETUP
@@ -443,6 +444,37 @@ def compute_stable_rois_for_field(field_data, total_timepoints, presence_thresho
             roi_counter += 1
             
     return stable_rois
+
+def export_fiji_rois(stable_rois, base_out_dir, well, field):
+    """
+    exports the stable rois as ImageJ-compatible .roi files.
+    also groups them into a .zip file for easy drag-and-drop into Fiji's ROI manager.
+    """
+    if roifile is None:
+        return
+        
+    roi_list = []
+    for r in stable_rois:
+        roi = roifile.ImagejRoi()
+        roi.roitype = 2  # 2 is the ImageJ code for OVAL
+        roi.left = int(max(0, r['x'] - r['radius']))
+        roi.top = int(max(0, r['y'] - r['radius']))
+        roi.right = int(r['x'] + r['radius'])
+        roi.bottom = int(r['y'] + r['radius'])
+        roi.name = f"{well}_f{field}_ROI_{r['id']:03d}"
+        roi_list.append(roi)
+        
+    if roi_list:
+        roi_dir = os.path.join(base_out_dir, "Fiji_ROIs", well, f"Field_{field}")
+        os.makedirs(roi_dir, exist_ok=True)
+        
+        # save individual .roi files
+        for roi in roi_list:
+            roi.tofile(os.path.join(roi_dir, f"{roi.name}.roi"))
+            
+        # save bundled zip for convenience (one level up, in the well folder)
+        zip_path = os.path.join(base_out_dir, "Fiji_ROIs", well, f"{well}_Field{field}_ROIs.zip")
+        roifile.roiwrite(zip_path, roi_list)
 
 # ==========================================
 # PARALLEL WORKER ENGINE
