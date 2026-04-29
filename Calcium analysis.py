@@ -214,20 +214,38 @@ def save_side_by_side_qc(img_raw, cell_labels, stable_rois, out_path, base_name)
 # SIGNAL PROCESSING & TRACE ANALYSIS
 # ==========================================
 
-def calculate_df_f0(trace, window=20):
+def calculate_df_f0(trace, window=20, method='percentile'):
     """
     calculates delta f / f0. 
-    uses a rolling percentile to handle slow photobleaching without killing peaks.
+    method 'percentile': uses a rolling percentile (handles slow drift/photobleaching).
+    method 'global_decay': fits a 2nd degree polynomial to the resting state to cancel initial slope.
     """
     trace_array = np.array(trace)
-    # use 20th percentile as baseline (f0)
-    f0 = ndi.percentile_filter(trace_array, percentile=20, size=window)
+    
+    if method == 'percentile':
+        # use 20th percentile as baseline (f0)
+        f0 = ndi.percentile_filter(trace_array, percentile=20, size=window, mode='nearest')
+    elif method == 'global_decay':
+        # fit a quadratic decay curve to capture the global slope/photobleaching.
+        x = np.arange(len(trace_array))
+        # to prevent spikes from pulling the baseline up, we fit only to the lower 50% of the trace
+        median_val = np.median(trace_array)
+        mask = trace_array <= median_val
+        
+        if np.sum(mask) < 3: # fallback if trace is exceptionally flat/short
+            mask = np.ones_like(trace_array, dtype=bool)
+            
+        coeffs = np.polyfit(x[mask], trace_array[mask], deg=2)
+        f0 = np.polyval(coeffs, x)
+    else:
+        raise ValueError(f"unknown baseline method: {method}")
+        
     # prevent division by zero
     f0[f0 == 0] = np.nan 
     df_f0 = (trace_array - f0) / f0
     return df_f0
 
-def analyze_traces_and_plot(well_field_data, stable_rois, dest_dir, well, field, fps=1.0, peak_prominence=0.1, peak_distance=3):
+def analyze_traces_and_plot(well_field_data, stable_rois, dest_dir, well, field, fps=1.0, peak_prominence=0.1, peak_distance=3, baseline_method='percentile'):
     """
     sorts temporal data, extracts raw and delta f / f0, finds peaks, 
     and plots all cells overlapped side-by-side (raw vs normalized) to check compensation.
@@ -255,7 +273,7 @@ def analyze_traces_and_plot(well_field_data, stable_rois, dest_dir, well, field,
         s = s.interpolate(method='linear').bfill().ffill()
         raw_trace = s.values
         
-        df_f0 = calculate_df_f0(raw_trace)
+        df_f0 = calculate_df_f0(raw_trace, method=baseline_method)
         
         # find peaks (prominence threshold filters out noise ripples)
         peaks, properties = signal.find_peaks(df_f0, prominence=peak_prominence, distance=peak_distance)
@@ -427,7 +445,8 @@ def process_calcium_directory(
     presence_threshold=0.75,
     acquisition_fps=1.0,
     peak_prominence=0.1,
-    peak_distance=3
+    peak_distance=3,
+    baseline_method='percentile'
 ):
     """master pipeline orchestrator."""
     search_pattern = os.path.join(data_dir, "*.[tT][iI][fF]*")
@@ -512,7 +531,8 @@ def process_calcium_directory(
                 time_data, stable_rois, dest_dir, well, field, 
                 fps=acquisition_fps, 
                 peak_prominence=peak_prominence, 
-                peak_distance=peak_distance
+                peak_distance=peak_distance,
+                baseline_method=baseline_method
             )
             all_cell_stats.extend(stats)
             
@@ -559,6 +579,10 @@ if __name__ == "__main__":
         'A02': 'Control',
         'B01': 'Treatment X',
         'B02': 'Treatment X',
+        'G02': 'Control',
+        'G03': 'Control',
+        'G04': 'Control',
+        'G05': 'Control',
         # any well not listed will just show up as its well name (e.g., 'C01')
     }
     
@@ -570,8 +594,9 @@ if __name__ == "__main__":
         tophat_radius=25,         
         roi_radius=6,             
         min_soma_dist=10,
-        presence_threshold=0.75,
+        presence_threshold=0.75, 
         acquisition_fps=1.0,      # change to your actual camera frame rate (hz)
         peak_prominence=0.1,      # min height above baseline to count as a true calcium peak
-        peak_distance=3           # min frames between spikes to prevent double counting noise
+        peak_distance=3,          # min frames between spikes to prevent double counting noise
+        baseline_method='global_decay' # toggle between 'percentile' and 'global_decay'
     )
