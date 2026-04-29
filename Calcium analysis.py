@@ -260,6 +260,13 @@ def analyze_traces_and_plot(well_field_data, stable_rois, dest_dir, well, field,
     # setup trace plot: 1 row, 2 columns
     fig, axes = plt.subplots(1, 2, figsize=(14, 5), sharex=True)
     
+    # setup massive grid plot for all individual cell baselines
+    if n_cells > 0:
+        cols = int(np.ceil(np.sqrt(n_cells)))
+        rows = int(np.ceil(n_cells / cols))
+        fig_grid, axes_grid = plt.subplots(rows, cols, figsize=(cols*3, rows*2), sharex=True)
+        axes_flat = np.atleast_1d(axes_grid).flatten()
+
     t_sec = np.array(timepoints) / fps
     # generate a color palette for the cells so overlapping lines are distinguishable
     colors = plt.cm.viridis(np.linspace(0, 1, n_cells))
@@ -273,7 +280,7 @@ def analyze_traces_and_plot(well_field_data, stable_rois, dest_dir, well, field,
         s = s.interpolate(method='linear').bfill().ffill()
         raw_trace = s.values
         
-        df_f0 = calculate_df_f0(raw_trace, method=baseline_method)
+        df_f0, f0 = calculate_df_f0(raw_trace, method=baseline_method)
         
         # find peaks (prominence threshold filters out noise ripples)
         peaks, properties = signal.find_peaks(df_f0, prominence=peak_prominence, distance=peak_distance)
@@ -299,6 +306,20 @@ def analyze_traces_and_plot(well_field_data, stable_rois, dest_dir, well, field,
         # plot normalized trace overlapped
         axes[1].plot(t_sec, df_f0, color=colors[i], lw=1.2, alpha=0.7)
         
+        # plot individual baseline on grid
+        if n_cells > 0:
+            ax_grid = axes_flat[i]
+            ax_grid.plot(t_sec, raw_trace, color='black', lw=1.0, alpha=0.8)
+            ax_grid.plot(t_sec, f0, color='red', lw=1.5)
+            
+            # highlight peaks on the individual raw trace subplot
+            if len(peaks) > 0:
+                ax_grid.plot(t_sec[peaks], raw_trace[peaks], marker='o', linestyle='none', color='blue', markersize=3, zorder=3)
+                
+            ax_grid.set_title(f"ROI {roi_id}", fontsize=9)
+            ax_grid.spines['top'].set_visible(False)
+            ax_grid.spines['right'].set_visible(False)
+
     axes[0].set_title(f"{well} Field {field} - raw fluorescence", fontweight='bold')
     axes[0].set_ylabel("raw intensity (a.u.)")
     axes[0].set_xlabel("time (s)")
@@ -316,6 +337,55 @@ def analyze_traces_and_plot(well_field_data, stable_rois, dest_dir, well, field,
     plt.savefig(out_path, dpi=150)
     plt.close(fig)
     
+    # finalize and save massive grid plot
+    if n_cells > 0:
+        # hide any unused subplots in the grid if cell count isn't a perfect square
+        for j in range(n_cells, len(axes_flat)):
+            fig_grid.delaxes(axes_flat[j])
+            
+        fig_grid.suptitle(f"{well} Field {field} - Raw vs Estimated Baseline ($F_0$)", fontweight='bold', fontsize=16)
+        fig_grid.tight_layout()
+        out_grid_path = os.path.join(dest_dir, f"{well}_Field{field}_all_baselines.png")
+        fig_grid.savefig(out_grid_path, dpi=150)
+        plt.close(fig_grid)
+        
+        # generate heatmap / raster plot
+        fig_hm, ax_hm = plt.subplots(figsize=(10, max(4, n_cells * 0.3)))
+        df_mat = np.array(df_f0_matrix)
+        
+        # clip extreme outliers at the 5th and 95th percentiles so the colorbar contrasts well
+        vmin, vmax = np.nanpercentile(df_mat, 5), np.nanpercentile(df_mat, 95)
+        
+        im = ax_hm.imshow(
+            df_mat, 
+            aspect='auto', 
+            cmap='viridis', 
+            extent=[t_sec[0], t_sec[-1], n_cells, 0],
+            vmin=vmin, 
+            vmax=vmax
+        )
+        
+        # overlay peaks as white raster ticks
+        for j, pks in enumerate(peak_list):
+            if len(pks) > 0:
+                ax_hm.plot(t_sec[pks], np.full_like(pks, j + 0.5), marker='|', color='white', linestyle='none', markersize=6, markeredgewidth=1.5)
+                
+        ax_hm.set_xlabel("time (s)")
+        ax_hm.set_ylabel("ROI ID")
+        
+        roi_ids = [r['id'] for r in stable_rois]
+        if n_cells <= 40: # only label individual cells if there aren't too many to read
+            ax_hm.set_yticks(np.arange(n_cells) + 0.5)
+            ax_hm.set_yticklabels(roi_ids)
+            
+        fig_hm.colorbar(im, ax=ax_hm, label=r"$\Delta F/F_0$")
+        ax_hm.set_title(f"{well} Field {field} - Population Activity Heatmap", fontweight='bold')
+        
+        plt.tight_layout()
+        out_hm_path = os.path.join(dest_dir, f"{well}_Field{field}_heatmap.png")
+        fig_hm.savefig(out_hm_path, dpi=150)
+        plt.close(fig_hm)
+
     return cell_stats
 
 # ==========================================
