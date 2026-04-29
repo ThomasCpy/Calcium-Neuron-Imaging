@@ -272,6 +272,9 @@ def analyze_traces_and_plot(well_field_data, stable_rois, dest_dir, well, field,
     # generate a color palette for the cells so overlapping lines are distinguishable
     colors = plt.cm.viridis(np.linspace(0, 1, n_cells))
     
+    df_f0_matrix = []
+    peak_list = []
+
     for i, roi in enumerate(stable_rois):
         roi_id = roi['id']
         raw_trace = [well_field_data[t].get(roi_id, np.nan) for t in timepoints]
@@ -286,6 +289,9 @@ def analyze_traces_and_plot(well_field_data, stable_rois, dest_dir, well, field,
         # find peaks (prominence threshold filters out noise ripples)
         peaks, properties = signal.find_peaks(df_f0, prominence=peak_prominence, distance=peak_distance)
         
+        df_f0_matrix.append(df_f0)
+        peak_list.append(peaks)
+
         freq = len(peaks) / (len(timepoints) / fps) # peaks per second
         # amplitude: average peak height relative to baseline, or max-min if no peaks
         if len(peaks) > 0:
