@@ -465,6 +465,10 @@ def process_calcium_directory(
     base_out_dir = os.path.dirname(data_dir)
     stats_out_dir, structure_dict = setup_dynamic_output(base_out_dir, [f[0] for f in target_files], "Output Calcium Analysis")
     
+    if roifile is None:
+        print("\n[!] warning: 'roifile' package not found. Fiji .roi files will not be exported.")
+        print("    to enable this feature, run: pip install roifile")
+    
     max_workers = os.cpu_count() if os.cpu_count() else 1
     
     # ---------------------------------------------------------
@@ -494,6 +498,9 @@ def process_calcium_directory(
         stable_rois = compute_stable_rois_for_field(time_data, total_timepoints=total_t, presence_threshold=presence_threshold, clustering_dist=min_soma_dist)
         stable_rois_dict[wf_key] = stable_rois
         print(f"  > {wf_key[0]} field {wf_key[1]}: found {len(stable_rois)} stable cells.")
+        
+        # export to fiji
+        export_fiji_rois(stable_rois, stats_out_dir, wf_key[0], wf_key[1])
 
     # ---------------------------------------------------------
     # PASS 2: extract trace intensities and save qc images
