@@ -575,10 +575,6 @@ if __name__ == "__main__":
     
     # user maps wells to conditions here for the violin plots
     exp_condition_map = {
-        'A01': 'Control',
-        'A02': 'Control',
-        'B01': 'Treatment X',
-        'B02': 'Treatment X',
         'G02': 'Control',
         'G03': 'Control',
         'G04': 'Control',
